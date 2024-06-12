@@ -28,6 +28,115 @@
 
 #include "wt_internal.h"
 
+#define INITIAL_FID 1
+#define MAX_FILE_ENTRIES 255
+
+enum operations
+{
+    OP_UNKNOWN,
+    OP_OPEN,
+    OP_CLOSE,
+    OP_READ,
+    OP_WRITE,
+    OP_FSYNC,
+    OP_FDATASYNC,
+    OP_TRUNC,
+    OP_MAX
+};
+
+typedef struct file_entry
+{
+    int fd;
+    char *name;
+} file_entry;
+
+/* output file handle for logging operations */
+static FILE *tracef;
+static int curr_fid = INITIAL_FID;
+static file_entry file_map[MAX_FILE_ENTRIES];
+
+static const char *op_strtab[] =
+{
+    "unknown",
+    "OPEN",
+    "CLOSE",
+    "READ",
+    "WRITE",
+    "FSYNC",
+    "FDATASYNC",
+    "TRUNC",
+};
+
+static void ubc_set_fid(int fd, const char *name)
+{
+    file_map[curr_fid].fd = fd;
+	if (!name)
+	{
+		printf("NULL name !\n");
+	}
+	else
+	{
+    file_map[curr_fid].name = strdup(name);
+	}
+    curr_fid++;
+    if (curr_fid == MAX_FILE_ENTRIES)
+        printf("Maximum files reached\n");
+}
+
+/*
+	Search in the reverse direction, to find the latest use of the fd
+	in case the fd has been reused for a different file.
+*/
+static int ubc_lookup_fid(int fd)
+{
+    for (int fid = curr_fid - 1; fid >= INITIAL_FID; fid--)
+    {
+        if (file_map[fid].fd == fd)
+			{
+            return fid;
+			}
+    }
+
+    return 0;
+}
+
+/*
+    Print a log of file operations, in UBC format
+    Based on FIU format, but with modifications:
+    1) all records are 7 fields long (the number of fields is independent of the operation)
+    2) inode size is not recorded on every file access
+    3) cache information is not recorded
+    [seq num] [ts in ns] [process id] [operation] [file num] [offset in Bytes] [size in Bytes]
+*/
+static void print_ubc_log(FILE *outf, uint8_t op, int inode, uint32_t size, int64_t offset)
+{
+    static uint32_t seqnum;
+    static double ts;
+    int fid;
+    int32_t pid = getpid();
+
+    if (op >= OP_MAX)
+    {
+        printf("Error: unhandled operation %u\n", op);
+        return;
+    }
+
+    // add timestamp
+
+    if (!outf)
+    {
+        printf("NULL handle\n");
+        while(1);
+    }
+
+    fid = ubc_lookup_fid(inode);
+    if (!fid)
+        printf("File %i not opened\n", inode);
+
+    fprintf(outf, "%u %8.8f %i %s %i %u %li\n", seqnum, ts, pid, op_strtab[op], fid, size, offset);
+    fflush(outf);
+}
+
 /*
  * This LWN article (https://lwn.net/Articles/731706/) describes a potential problem when mmap is
  * used over a direct-access (DAX) file system. If a new block is created and then the file is
@@ -185,6 +294,7 @@ __posix_sync(WT_SESSION_IMPL *session, int fd, const char *name, const char *fun
     static enum { FF_NOTSET, FF_IGNORE, FF_OK } ff_status = FF_NOTSET;
     switch (ff_status) {
     case FF_NOTSET:
+        print_ubc_log(tracef, OP_FDATASYNC, fd, 0, 0);
         WT_SYSCALL(fcntl(fd, F_FULLFSYNC, 0) == -1 ? -1 : 0, ret);
         if (ret == 0) {
             ff_status = FF_OK;
@@ -201,6 +311,7 @@ __posix_sync(WT_SESSION_IMPL *session, int fd, const char *name, const char *fun
     case FF_IGNORE:
         break;
     case FF_OK:
+        print_ubc_log(tracef, OP_FDATASYNC, fd, 0, 0);
         WT_SYSCALL(fcntl(fd, F_FULLFSYNC, 0) == -1 ? -1 : 0, ret);
         if (ret == 0)
             return (0);
@@ -214,12 +325,14 @@ __posix_sync(WT_SESSION_IMPL *session, int fd, const char *name, const char *fun
  */
 #if defined(HAVE_FDATASYNC) && !defined(BSD)
     /* See comment in __posix_sync(): sync cannot be retried or fail. */
+    print_ubc_log(tracef, OP_FDATASYNC, fd, 0, 0);
     WT_SYSCALL(fdatasync(fd), ret);
     if (ret == 0)
         return (0);
     WT_RET_PANIC(session, ret, "%s: %s: fdatasync", name, func);
 #else
     /* See comment in __posix_sync(): sync cannot be retried or fail. */
+    print_ubc_log(tracef, OP_FSYNC, fd, 0, 0);
     WT_SYSCALL(fsync(fd), ret);
     if (ret == 0)
         return (0);
@@ -254,11 +367,15 @@ __posix_directory_sync(WT_SESSION_IMPL *session, const char *path)
 
     fd = 0; /* -Wconditional-uninitialized */
     WT_SYSCALL_RETRY(((fd = open(dir, O_RDONLY | O_CLOEXEC, 0444)) == -1 ? -1 : 0), ret);
+    ubc_set_fid(fd, dir);
+    print_ubc_log(tracef, OP_OPEN, fd, 0, 0);
     if (ret != 0)
         WT_ERR_MSG(session, ret, "%s: directory-sync: open", dir);
 
+    print_ubc_log(tracef, OP_FSYNC, fd, 0, 0);
     ret = __posix_sync(session, fd, dir, "directory-sync");
 
+    print_ubc_log(tracef, OP_CLOSE, fd, 0, 0);
     WT_SYSCALL(close(fd), tret);
     if (tret != 0) {
         __wt_err(session, tret, "%s: directory-sync: close", dir);
@@ -478,6 +595,7 @@ __posix_file_close(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session)
 
     /* Close the file handle. */
     if (pfh->fd != -1) {
+        print_ubc_log(tracef, OP_CLOSE, pfh->fd, 0, 0);
         WT_SYSCALL(close(pfh->fd), ret);
         if (ret != 0)
             __wt_err(session, ret, "%s: handle-close: close", file_handle->name);
@@ -558,6 +676,7 @@ __posix_file_read(
          * reads bytes, adjust the return value. pread returns 0 when its EOF and if that is reached
          * it is unexpected as we know how much we are reading.
          */
+        print_ubc_log(tracef, OP_READ, pfh->fd, chunk, offset);
         WT_SYSCALL_RETRY((nr = pread(pfh->fd, addr, chunk, offset)) <= 0 ? -1 : 0, ret);
         if (ret != 0)
             WT_RET_MSG(session, nr == 0 ? WT_ERROR : ret,
@@ -653,6 +772,7 @@ __posix_file_sync_nowait(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session)
     pfh = (WT_FILE_HANDLE_POSIX *)file_handle;
 
     /* See comment in __posix_sync(): sync cannot be retried or fail. */
+    print_ubc_log(tracef, OP_FDATASYNC, pfh->fd, 0, 0);
     WT_SYSCALL(sync_file_range(pfh->fd, (off64_t)0, (off64_t)0, SYNC_FILE_RANGE_WRITE), ret);
     if (ret == 0)
         return (0);
@@ -683,6 +803,7 @@ __posix_file_truncate(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session, wt_of
     /* Always call prepare. It will return whether a remap is needed or not. */
     __wti_posix_prepare_remap_resize_file(file_handle, wt_session, len, &remap);
 
+    print_ubc_log(tracef, OP_TRUNC, pfh->fd, len, 0);
     WT_SYSCALL_RETRY(ftruncate(pfh->fd, len), ret);
     if (remap) {
         if (ret == 0)
@@ -730,6 +851,7 @@ __posix_file_write(
               "%s: handle-write: pwrite: failed to write %" WT_SIZET_FMT
               " bytes at offset %" PRIuMAX,
               file_handle->name, chunk, (uintmax_t)offset);
+        print_ubc_log(tracef, OP_WRITE, pfh->fd, chunk, offset);
     }
     WT_STAT_CONN_INCRV(session, block_byte_write_syscall, len);
     return (0);
@@ -871,6 +993,8 @@ __posix_open_file(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const cha
         f |= O_CLOEXEC;
 #endif
         WT_SYSCALL_RETRY(((pfh->fd = open(name, f, 0444)) == -1 ? -1 : 0), ret);
+        ubc_set_fid(pfh->fd, name);
+        print_ubc_log(tracef, OP_OPEN, pfh->fd, 0, 0);
         if (ret != 0)
             WT_ERR_MSG(session, ret, "%s: handle-open: open-directory", name);
         WT_ERR(__posix_open_file_cloexec(session, pfh->fd, name));
@@ -923,6 +1047,8 @@ __posix_open_file(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const cha
 
     /* Create/Open the file. */
     WT_SYSCALL_RETRY(((pfh->fd = open(name, f, mode)) == -1 ? -1 : 0), ret);
+    ubc_set_fid(pfh->fd, name);
+    print_ubc_log(tracef, OP_OPEN, pfh->fd, 0, 0);
     if (ret != 0)
         WT_ERR_MSG(session, ret,
           pfh->direct_io ? "%s: handle-open: open: failed with direct I/O configured, some "
@@ -1042,10 +1168,35 @@ static int
 __posix_terminate(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session)
 {
     WT_SESSION_IMPL *session;
+    const char outname[] = "operations.ubc";
+    FILE *finalf;
+    int c;
 
     session = (WT_SESSION_IMPL *)wt_session;
 
     __wt_free(session, file_system);
+
+    finalf = fopen(outname, "w");
+
+    // write a header
+    fprintf(finalf, "UBC 1.0\n");
+
+    // write the file map
+    for (int fid = INITIAL_FID; fid < curr_fid; fid++)
+        fprintf(finalf, "%i %i %s\n", fid, file_map[fid].fd, file_map[fid].name);
+    fprintf(finalf, "---\n");
+    
+    // append the rest of the log
+    fseek(tracef, 0, SEEK_SET);
+    while ((c = fgetc(tracef)) != EOF)
+        fputc(c, finalf);
+
+    fclose(finalf);
+    fclose(tracef);
+
+    //for (int fid = INITIAL_FID; fid < curr_fid; fid++)
+     //   free(file_map[fid].name);
+
     return (0);
 }
 
@@ -1058,10 +1209,16 @@ __wt_os_posix(WT_SESSION_IMPL *session)
 {
     WT_CONNECTION_IMPL *conn;
     WT_FILE_SYSTEM *file_system;
+    const char outname[] = "tmp.ubc";
 
     conn = S2C(session);
 
     WT_RET(__wt_calloc_one(session, &file_system));
+
+    /* open the temporary operation log */
+    tracef = fopen(outname, "w+");
+    if (!tracef)
+        printf("Error opening output file %s\n", outname);
 
     /* Initialize the POSIX jump table. */
     file_system->fs_directory_list = __wti_posix_directory_list;
